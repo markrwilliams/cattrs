@@ -1,4 +1,6 @@
+import attr
 from enum import Enum
+from six import raise_from
 from typing import (List, Mapping, Sequence, Optional, MutableSequence,
                     TypeVar, Any, FrozenSet, MutableSet, Set, MutableMapping,
                     Dict, Tuple, _Union)
@@ -10,6 +12,22 @@ from .multistrategy_dispatch import MultiStrategyDispatch
 NoneType = type(None)
 T = TypeVar('T')
 V = TypeVar('V')
+
+
+def format_context(ctx):
+    """Format the context to show causality."""
+    return "->".join(repr(element) for element in ctx)
+
+
+class UnstructuringError(Exception):
+    """A validation error on unstructuring."""
+
+    def __init__(self, ctx, message):
+        if ctx:
+            exc_message = "{}: {}".format(format_context(ctx), message)
+        else:
+            exc_message = message
+        super(UnstructuringError, self).__init__(exc_message)
 
 
 class UnstructureStrategy(Enum):
@@ -199,7 +217,7 @@ class Converter(object):
 
     # Python primitives to classes.
 
-    def _structure_default(self, obj, cl):
+    def _structure_default(self, obj, cl, ctx=()):
         """This is the fallthrough case. Everything is a subclass of `Any`.
 
         A special condition here handles ``attrs`` classes.
@@ -210,54 +228,77 @@ class Converter(object):
         if cl is Any or cl is Optional:
             return obj
         # We don't know what this is, so we complain loudly.
-        msg = "Unsupported type: {0}. Register a structure hook for " \
-              "it.".format(cl)
-        raise ValueError(msg)
+        msg = "Unsupported type: {0} {0}. Register a structure hook for " \
+              "it.".format(cl, )
+        raise UnstructuringError(ctx, msg)
 
-    def _structure_call(self, obj, cl):
+    def _structure_call(self, obj, cl, ctx=()):
         """Just call ``cl`` with the given ``obj``.
 
         This is just an optimization on the ``_structure_default`` case, when
         we know we can skip the ``if`` s. Use for ``str``, ``bytes``, ``enum``,
         etc.
         """
-        return cl(obj)
+        try:
+            return cl(obj)
+        except Exception as e:
+            raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_unicode(self, obj, cl):
+    def _structure_unicode(self, obj, cl, ctx=()):
         """Just call ``cl`` with the given ``obj``"""
         if not isinstance(obj, (bytes, unicode)):
-            return cl(str(obj))
+            try:
+                return cl(str(obj))
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
         else:
-            return obj
+            try:
+                return obj
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
 
     # Attrs classes.
 
-    def structure_attrs_fromtuple(self, obj, cl):
+    def structure_attrs_fromtuple(self, obj, cl, ctx=()):
         # type: (Sequence[Any], Type) -> Any
         """Load an attrs class from a sequence (tuple)."""
         conv_obj = []  # A list of converter parameters.
         for a, value in zip(cl.__attrs_attrs__, obj):
             # We detect the type by the metadata.
-            converted = self._structure_attr_from_tuple(a, a.name, value)
+            converted = self._structure_attr_from_tuple(
+                a, a.name, value, ctx + (a.name,)
+            )
             conv_obj.append(converted)
 
-        return cl(*conv_obj)
+        try:
+            return cl(*conv_obj)
+        except Exception as e:
+            raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_attr_from_tuple(self, a, name, value):
+    def _structure_attr_from_tuple(self, a, name, value, ctx=()):
         """Handle an individual attrs attribute."""
         type_ = a.type
         if type_ is None:
             # No type metadata.
             return value
-        return self._structure_func.dispatch(type_)(value, type_)
+        try:
+            return self._structure_func.dispatch(type_)(value, type_, ctx)
+        except UnstructuringError:
+            raise
+        except Exception as e:
+            raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def structure_attrs_fromdict(self, obj, cl):
+    def structure_attrs_fromdict(self, obj, cl, ctx=()):
         # type: (Mapping, Type) -> Any
         """Instantiate an attrs class from a mapping (dict)."""
         # For public use.
+        ctx += (cl.__name__,)
         conv_obj = obj.copy()  # Dict of converted parameters.
         dispatch = self._structure_func.dispatch
+        required = set()
         for a in cl.__attrs_attrs__:
+            if a.default is attr.NOTHING:
+                required.add(a.name)
             # We detect the type by metadata.
             type_ = a.type
             if type_ is None:
@@ -268,41 +309,80 @@ class Converter(object):
                 val = obj[name]
             except KeyError:
                 continue
-            conv_obj[name] = dispatch(type_)(val, type_)
+            conv_obj[name] = dispatch(type_)(val, type_, ctx + (name,))
 
-        return cl(**conv_obj)
+        try:
+            return cl(**conv_obj)
+        except TypeError:
+            missing = required - set(conv_obj)
+            raise UnstructuringError(ctx,
+                                     "missing arguments: {}".format(missing))
+        except Exception as e:
+            raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_list(self, obj, cl):
+    def _structure_list(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Iterable[T]) -> List[T]
         """Convert an iterable to a potentially generic list."""
         if not cl.__args__ or cl.__args__[0] is Any:
-            return [e for e in obj]
+            try:
+                return [e for e in obj]
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
         else:
             elem_type = cl.__args__[0]
-            return [self._structure_func.dispatch(elem_type)(e, elem_type)
-                    for e in obj]
+            try:
+                return [
+                    self._structure_func.dispatch(elem_type)(
+                        e, elem_type, ctx + (i,)
+                    )
+                    for i, e in enumerate(obj)
+                ]
+            except UnstructuringError:
+                raise
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_set(self, obj, cl):
+    def _structure_set(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Iterable[T]) -> MutableSet[T]
         """Convert an iterable into a potentially generic set."""
         if not cl.__args__ or cl.__args__[0] is Any:
-            return set(obj)
+            try:
+                return set(obj)
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
         else:
             elem_type = cl.__args__[0]
-            return {self._structure_func.dispatch(elem_type)(e, elem_type)
-                    for e in obj}
+            try:
+                return {
+                    self._structure_func.dispatch(elem_type)(e, elem_type, ctx)
+                    for e in obj
+                }
+            except UnstructuringError:
+                raise
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_frozenset(self, obj, cl):
+    def _structure_frozenset(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Iterable[T]) -> FrozenSet[T]
         """Convert an iterable into a potentially generic frozenset."""
         if not cl.__args__ or cl.__args__[0] is Any:
-            return frozenset(obj)
+            try:
+                return frozenset(obj)
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
         else:
             elem_type = cl.__args__[0]
             dispatch = self._structure_func.dispatch
-            return frozenset(dispatch(elem_type)(e, elem_type) for e in obj)
+            try:
+                return frozenset(
+                    dispatch(elem_type)(e, elem_type, ctx) for e in obj
+                )
+            except UnstructuringError:
+                raise
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_dict(self, obj, cl):
+    def _structure_dict(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Mapping[T, V]) -> Dict[T, V]
         """Convert a mapping into a potentially generic dict."""
         if not cl.__args__ or cl.__args__ == (Any, Any):
@@ -311,17 +391,42 @@ class Converter(object):
             key_type, val_type = cl.__args__
             if key_type is Any:
                 val_conv = self._structure_func.dispatch(val_type)
-                return {k: val_conv(v, val_type) for k, v in obj.items()}
+                try:
+                    return {
+                        k: val_conv(v, val_type, ctx + (k,))
+                        for k, v in obj.items()
+                    }
+                except UnstructuringError:
+                    raise
+                except Exception as e:
+                    raise_from(UnstructuringError(ctx, str(e)), e)
             elif val_type is Any:
                 key_conv = self._structure_func.dispatch(key_type)
-                return {key_conv(k, key_type): v for k, v in obj.items()}
+                try:
+                    return {
+                        key_conv(k, key_type, ctx + (k,)): v
+                        for k, v in obj.items()
+                    }
+                except UnstructuringError:
+                    raise
+                except Exception as e:
+                    raise_from(UnstructuringError(ctx, str(e)), e)
             else:
                 key_conv = self._structure_func.dispatch(key_type)
                 val_conv = self._structure_func.dispatch(val_type)
-                return {key_conv(k, key_type): val_conv(v, val_type)
-                        for k, v in obj.items()}
+                try:
+                    return {
+                        key_conv(k, key_type): val_conv(
+                            v, val_type, ctx + (k,)
+                        )
+                        for k, v in obj.items()
+                    }
+                except UnstructuringError:
+                    raise
+                except Exception as e:
+                    raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_union(self, obj, union):
+    def _structure_union(self, obj, union, ctx=()):
         # type: (_Union, Any): -> Any
         """Deal with converting a union."""
 
@@ -335,7 +440,12 @@ class Converter(object):
         # Check the union registry first.
         handler = self._union_registry.get(union)
         if handler is not None:
-            return handler(obj, union)
+            try:
+                return handler(obj, union, ctx)
+            except UnstructuringError:
+                raise
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
 
         # Unions with NoneType in them are basically optionals.
         union_params = union.__args__
@@ -347,31 +457,62 @@ class Converter(object):
                 other = (union_params[0] if union_params[1] is NoneType
                          else union_params[1])
                 # We can't actually have a Union of a Union, so this is safe.
-                return self._structure_func.dispatch(other)(obj, other)
+                try:
+                    return self._structure_func.dispatch(other)(
+                        obj, other, ctx,
+                    )
+                except UnstructuringError:
+                    raise
+                except Exception as e:
+                    raise_from(UnstructuringError(ctx, str(e)), e)
 
         # Getting here means either this is not an optional, or it's an
         # optional with more than one parameter.
         # Let's support only unions of attr classes for now.
         cl = self._dis_func_cache(union)(obj)
-        return self._structure_func.dispatch(cl)(obj, cl)
+        try:
+            return self._structure_func.dispatch(cl)(
+                obj, cl, ctx,
+            )
+        except UnstructuringError:
+            raise
+        except Exception as e:
+            raise_from(UnstructuringError(ctx, str(e)), e)
 
-    def _structure_tuple(self, obj, tup):
+    def _structure_tuple(self, obj, tup, ctx=()):
         # type: (Type[Tuple], Iterable) -> Any
         """Deal with converting to a tuple."""
         tup_params = tup.__args__
         has_ellipsis = (tup_params and tup_params[-1] is Ellipsis)
         if tup_params is None or (has_ellipsis and tup_params[0] is Any):
             # Just a Tuple. (No generic information.)
-            return tuple(obj)
+            try:
+                return tuple(obj)
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
         if has_ellipsis:
             # We're dealing with a homogenous tuple, Tuple[int, ...]
             tup_type = tup_params[0]
             conv = self._structure_func.dispatch(tup_type)
-            return tuple(conv(e, tup_type) for e in obj)
+            try:
+                return tuple(
+                    conv(e, tup_type, ctx + (i,)) for i, e in enumerate(obj)
+                )
+            except UnstructuringError:
+                raise
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
         else:
             # We're dealing with a heterogenous tuple.
-            return tuple(self._structure_func.dispatch(t)(e, t)
-                         for t, e in zip(tup_params, obj))
+            try:
+                return tuple(
+                    self._structure_func.dispatch(t)(e, t, ctx + (i,))
+                    for i, t, e in enumerate(zip(tup_params, obj))
+                )
+            except UnstructuringError:
+                raise
+            except Exception as e:
+                raise_from(UnstructuringError(ctx, str(e)), e)
 
     def _get_dis_func(self, union):
         # type: (Type) -> Callable[..., Type]

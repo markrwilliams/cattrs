@@ -5,14 +5,14 @@ from typing import (List, Tuple, Any, Set, MutableSet, FrozenSet,
                     Dict, Optional, Union)
 from cattr._compat import bytes, unicode, is_py2
 
-from pytest import raises
+from pytest import fixture, mark, raises
 
 from hypothesis import assume, given
 from hypothesis.strategies import (booleans, integers, floats, text, one_of,
                                    sampled_from, lists, tuples, sets,
                                    frozensets, just, binary, choices, data)
 
-from cattr import Converter
+from cattr import Converter, StructuringError
 
 from . import (primitive_strategies, seqs_of_primitives, lists_of_primitives,
                dicts_of_primitives, enums_of_primitives)
@@ -52,6 +52,19 @@ frozen_sets_of_primitives = primitive_strategies.flatmap(
 sets_of_primitives = one_of(mut_sets_of_primitives, frozen_sets_of_primitives)
 
 
+def converter_and_exc(exc):
+    # type: (Exception) -> None
+    """ Parametrize a test with a ``converter`` and ``exc`` argument.
+    When ``converter`` has ``contextualize_structure_errors`` set to
+    ``True``, ``exc`` will be ``StructuringError``; otherwise it will
+    be ``exc``.
+    """
+    return mark.parametrize("converter,exc", [
+        (Converter(), exc),
+        (Converter(contextualize_structure_errors=True), StructuringError),
+    ])
+
+
 @given(primitives_and_type)
 def test_structuring_primitives(converter, primitive_and_type):
     # type: (Converter, Any) -> None
@@ -72,7 +85,9 @@ def test_structuring_seqs(converter, seq_and_type):
 
 
 @given(sets_of_primitives, set_types)
-def test_structuring_sets(converter, set_and_type, set_type):
+def test_structuring_sets(
+        converter, set_and_type, set_type
+):
     # type: (Converter, Any, Type) -> None
     """Test structuring generic sets."""
     set_, input_set_type = set_and_type
@@ -119,7 +134,9 @@ def test_stringifying_sets(converter, set_and_type):
 
 
 @given(lists(primitives_and_type, min_size=1))
-def test_structuring_hetero_tuples(converter, list_of_vals_and_types):
+def test_structuring_hetero_tuples(
+        converter, list_of_vals_and_types
+):
     # type: (Converter, List[Any]) -> None
     """Test structuring heterogenous tuples."""
     types = tuple(e[1] for e in list_of_vals_and_types)
@@ -187,7 +204,9 @@ def test_stringifying_dicts(converter, dict_and_type):
     # type: (Converter, Any) -> None
     d, t = dict_and_type
 
-    converted = converter.structure(d, Dict[unicode, unicode])
+    converted = converter.structure(
+        d, Dict[unicode, unicode]
+    )
 
     for k, v in d.items():
         assert converted[_as_str(k)] == _as_str(v)
@@ -203,8 +222,9 @@ def test_structuring_optional_primitives(converter, primitive_and_type):
     assert converter.structure(None, Optional[type]) is None
 
 
-@given(lists_of_primitives().filter(lambda lp: lp[1].__args__))
-def test_structuring_lists_of_opt(converter, list_and_type):
+@converter_and_exc(TypeError)
+@given(list_and_type=lists_of_primitives().filter(lambda lp: lp[1].__args__))
+def test_structuring_lists_of_opt(converter, exc, list_and_type):
     # type: (Converter, List[Any]) -> None
     """Test structuring lists of Optional primitive types."""
     l, t = list_and_type
@@ -213,7 +233,7 @@ def test_structuring_lists_of_opt(converter, list_and_type):
     args = t.__args__
 
     if args and args[0] not in (Any, unicode, str, Optional):
-        with raises(TypeError):
+        with raises(exc):
             converter.structure(l, t)
 
     optional_t = Optional[args[0]]
@@ -245,13 +265,17 @@ def test_stringifying_lists_of_opt(converter, list_and_type):
 
 
 @given(lists(integers()))
-def test_structuring_primitive_union_hook(converter, ints):
+def test_structuring_primitive_union_hook(converter, hook_wrapper, ints):
     # type: (Converter, List[int]) -> None
     """Registering a union loading hook works."""
 
-    def structure_hook(val, cl):
+    def _structure_hook(val, cl):
         """Even ints are passed through, odd are stringified."""
         return val if val % 2 == 0 else unicode(val)
+
+    @hook_wrapper
+    def structure_hook(val, cl):
+        return _structure_hook(val, cl)
 
     converter.register_structure_hook(Union[unicode, int], structure_hook)
 
@@ -264,12 +288,14 @@ def test_structuring_primitive_union_hook(converter, ints):
             assert unicode(x) == y
 
 
-def test_structure_hook_func(converter):
+@converter_and_exc(ValueError)
+def test_structure_hook_func(converter, hook_wrapper, exc):
     """ testing the hook_func method """
 
     def can_handle(cls):
         return cls.__name__.startswith("F")
 
+    @hook_wrapper
     def handle(obj, cls):
         return "hi"
 
@@ -282,7 +308,7 @@ def test_structure_hook_func(converter):
     converter.register_structure_hook_func(can_handle, handle)
 
     assert converter.structure(10, Foo) == "hi"
-    with raises(ValueError):
+    with raises(exc):
         converter.structure(10, Bar)
 
 
@@ -295,10 +321,11 @@ def test_structuring_enums(converter, choice, enum):
     assert converter.structure(val.value, enum) == val
 
 
-def test_structuring_unsupported(converter):
+@converter_and_exc(ValueError)
+def test_structuring_unsupported(converter, exc):
     # type: (Converter) -> None
     """Loading unsupported classes should throw."""
-    with raises(ValueError):
+    with raises(exc):
         converter.structure(1, Converter)
     with raises(ValueError):
         converter.structure(1, Union[int, unicode])

@@ -1,10 +1,9 @@
 import attr
 from enum import Enum
-from six import raise_from
 from typing import (List, Mapping, Sequence, Optional, MutableSequence,
                     TypeVar, Any, FrozenSet, MutableSet, Set, MutableMapping,
                     Dict, Tuple, _Union)
-from ._compat import lru_cache, unicode, bytes, is_py2
+from ._compat import lru_cache, unicode, bytes, is_py2, raise_from
 from .disambiguators import create_uniq_field_dis_func
 from .multistrategy_dispatch import MultiStrategyDispatch
 
@@ -19,15 +18,16 @@ def format_context(ctx):
     return "->".join(repr(element) for element in ctx)
 
 
-class UnstructuringError(Exception):
-    """A validation error on unstructuring."""
+class StructuringError(Exception):
+    """A validation error on structuring."""
 
     def __init__(self, ctx, message):
         if ctx:
             exc_message = "{}: {}".format(format_context(ctx), message)
         else:
             exc_message = message
-        super(UnstructuringError, self).__init__(exc_message)
+        super(StructuringError, self).__init__(exc_message)
+        self.ctx = ctx
 
 
 class UnstructureStrategy(Enum):
@@ -54,10 +54,13 @@ class Converter(object):
     """Converts between structured and unstructured data."""
     __slots__ = ('_dis_func_cache', '_unstructure_func', '_unstructure_attrs',
                  '_structure_attrs', '_dict_factory',
-                 '_union_registry', '_structure_func')
+                 '_union_registry', '_structure_func',
+                 '_contextualize_structure_errors',
+                 '_raise_structure_error')
 
     def __init__(self, dict_factory=dict,
-                 unstruct_strat=UnstructureStrategy.AS_DICT):
+                 unstruct_strat=UnstructureStrategy.AS_DICT,
+                 contextualize_structure_errors=False):
         unstruct_strat = UnstructureStrategy(unstruct_strat)
 
         # Create a per-instance cache.
@@ -67,6 +70,13 @@ class Converter(object):
         else:
             self._unstructure_attrs = self.unstructure_attrs_astuple
             self._structure_attrs = self.structure_attrs_fromtuple
+
+        self._contextualize_structure_errors = contextualize_structure_errors
+
+        if self._contextualize_structure_errors:
+            self._raise_structure_error = self._structure_error
+        else:
+            self._raise_structure_error = self._error_passthrough
 
         self._dis_func_cache = lru_cache()(self._get_dis_func)
 
@@ -119,6 +129,15 @@ class Converter(object):
         # Unions are instances now, not classes. We use different registry.
         self._union_registry = {}
 
+    def _structure_error(self, exc, ctx):
+        if isinstance(exc, StructuringError):
+            raise
+        else:
+            raise_from(StructuringError(ctx, str(exc)), exc)
+
+    def _error_passthrough(self, exc, ctx):
+        raise
+
     def unstructure(self, obj):
         return self._unstructure_func.dispatch(type(obj))(obj)
 
@@ -157,17 +176,28 @@ class Converter(object):
         is sometimes needed (for example, when dealing with generic classes).
         """
         # type: (Type[T], Callable[[Any, Type], T) -> None
-        if _is_union_type(cl):
-            self._union_registry[cl] = func
+        if self._contextualize_structure_errors:
+            hook_func = func
         else:
-            self._structure_func.register_cls_list([(cl, func)])
+            def hook_func(obj, cl, ctx=()):
+                return func(obj, cl)
+
+        if _is_union_type(cl):
+            self._union_registry[cl] = hook_func
+        else:
+            self._structure_func.register_cls_list([(cl, hook_func)])
 
     def register_structure_hook_func(self, check_func, func):
         # type: (Callable[Any], Callable[T], Any]) -> None
         """Register a class-to-primitive converter function for a class, using
         a function to check if it's a match.
         """
-        self._structure_func.register_func_list([(check_func, func)])
+        if self._contextualize_structure_errors:
+            hook_func = func
+        else:
+            def hook_func(obj, cl, ctx=()):
+                return func(obj, cl)
+        self._structure_func.register_func_list([(check_func, hook_func)])
 
     def structure(self, obj, cl):
         """Convert unstructured Python data structures to structured data."""
@@ -230,7 +260,10 @@ class Converter(object):
         # We don't know what this is, so we complain loudly.
         msg = "Unsupported type: {0} {0}. Register a structure hook for " \
               "it.".format(cl, )
-        raise UnstructuringError(ctx, msg)
+        if self._contextualize_structure_errors:
+            raise StructuringError(ctx, msg)
+        else:
+            raise ValueError(msg)
 
     def _structure_call(self, obj, cl, ctx=()):
         """Just call ``cl`` with the given ``obj``.
@@ -242,7 +275,7 @@ class Converter(object):
         try:
             return cl(obj)
         except Exception as e:
-            raise_from(UnstructuringError(ctx, str(e)), e)
+            self._raise_structure_error(e, ctx)
 
     def _structure_unicode(self, obj, cl, ctx=()):
         """Just call ``cl`` with the given ``obj``"""
@@ -250,12 +283,12 @@ class Converter(object):
             try:
                 return cl(str(obj))
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
         else:
             try:
                 return obj
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
 
     # Attrs classes.
 
@@ -273,7 +306,7 @@ class Converter(object):
         try:
             return cl(*conv_obj)
         except Exception as e:
-            raise_from(UnstructuringError(ctx, str(e)), e)
+            self._raise_structure_error(e, ctx)
 
     def _structure_attr_from_tuple(self, a, name, value, ctx=()):
         """Handle an individual attrs attribute."""
@@ -283,10 +316,8 @@ class Converter(object):
             return value
         try:
             return self._structure_func.dispatch(type_)(value, type_, ctx)
-        except UnstructuringError:
-            raise
         except Exception as e:
-            raise_from(UnstructuringError(ctx, str(e)), e)
+            self._raise_structure_error(e, ctx)
 
     def structure_attrs_fromdict(self, obj, cl, ctx=()):
         # type: (Mapping, Type) -> Any
@@ -314,11 +345,14 @@ class Converter(object):
         try:
             return cl(**conv_obj)
         except TypeError:
-            missing = required - set(conv_obj)
-            raise UnstructuringError(ctx,
-                                     "missing arguments: {}".format(missing))
+            if not self._contextualize_structure_errors:
+                raise
+            else:
+                missing = required - set(conv_obj)
+                raise StructuringError(ctx,
+                                       "missing arguments: {}".format(missing))
         except Exception as e:
-            raise_from(UnstructuringError(ctx, str(e)), e)
+            self._raise_structure_error(e, ctx)
 
     def _structure_list(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Iterable[T]) -> List[T]
@@ -327,7 +361,7 @@ class Converter(object):
             try:
                 return [e for e in obj]
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
         else:
             elem_type = cl.__args__[0]
             try:
@@ -337,10 +371,8 @@ class Converter(object):
                     )
                     for i, e in enumerate(obj)
                 ]
-            except UnstructuringError:
-                raise
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
 
     def _structure_set(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Iterable[T]) -> MutableSet[T]
@@ -349,7 +381,7 @@ class Converter(object):
             try:
                 return set(obj)
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
         else:
             elem_type = cl.__args__[0]
             try:
@@ -357,10 +389,8 @@ class Converter(object):
                     self._structure_func.dispatch(elem_type)(e, elem_type, ctx)
                     for e in obj
                 }
-            except UnstructuringError:
-                raise
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
 
     def _structure_frozenset(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Iterable[T]) -> FrozenSet[T]
@@ -369,7 +399,7 @@ class Converter(object):
             try:
                 return frozenset(obj)
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
         else:
             elem_type = cl.__args__[0]
             dispatch = self._structure_func.dispatch
@@ -377,10 +407,8 @@ class Converter(object):
                 return frozenset(
                     dispatch(elem_type)(e, elem_type, ctx) for e in obj
                 )
-            except UnstructuringError:
-                raise
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
 
     def _structure_dict(self, obj, cl, ctx=()):
         # type: (Type[GenericMeta], Mapping[T, V]) -> Dict[T, V]
@@ -396,10 +424,8 @@ class Converter(object):
                         k: val_conv(v, val_type, ctx + (k,))
                         for k, v in obj.items()
                     }
-                except UnstructuringError:
-                    raise
                 except Exception as e:
-                    raise_from(UnstructuringError(ctx, str(e)), e)
+                    self._raise_structure_error(e, ctx)
             elif val_type is Any:
                 key_conv = self._structure_func.dispatch(key_type)
                 try:
@@ -407,10 +433,8 @@ class Converter(object):
                         key_conv(k, key_type, ctx + (k,)): v
                         for k, v in obj.items()
                     }
-                except UnstructuringError:
-                    raise
                 except Exception as e:
-                    raise_from(UnstructuringError(ctx, str(e)), e)
+                    self._raise_structure_error(e, ctx)
             else:
                 key_conv = self._structure_func.dispatch(key_type)
                 val_conv = self._structure_func.dispatch(val_type)
@@ -421,10 +445,8 @@ class Converter(object):
                         )
                         for k, v in obj.items()
                     }
-                except UnstructuringError:
-                    raise
                 except Exception as e:
-                    raise_from(UnstructuringError(ctx, str(e)), e)
+                    self._raise_structure_error(e, ctx)
 
     def _structure_union(self, obj, union, ctx=()):
         # type: (_Union, Any): -> Any
@@ -442,10 +464,8 @@ class Converter(object):
         if handler is not None:
             try:
                 return handler(obj, union, ctx)
-            except UnstructuringError:
-                raise
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
 
         # Unions with NoneType in them are basically optionals.
         union_params = union.__args__
@@ -461,10 +481,8 @@ class Converter(object):
                     return self._structure_func.dispatch(other)(
                         obj, other, ctx,
                     )
-                except UnstructuringError:
-                    raise
                 except Exception as e:
-                    raise_from(UnstructuringError(ctx, str(e)), e)
+                    self._raise_structure_error(e, ctx)
 
         # Getting here means either this is not an optional, or it's an
         # optional with more than one parameter.
@@ -474,10 +492,8 @@ class Converter(object):
             return self._structure_func.dispatch(cl)(
                 obj, cl, ctx,
             )
-        except UnstructuringError:
-            raise
         except Exception as e:
-            raise_from(UnstructuringError(ctx, str(e)), e)
+            self._raise_structure_error(e, ctx)
 
     def _structure_tuple(self, obj, tup, ctx=()):
         # type: (Type[Tuple], Iterable) -> Any
@@ -489,7 +505,7 @@ class Converter(object):
             try:
                 return tuple(obj)
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
         if has_ellipsis:
             # We're dealing with a homogenous tuple, Tuple[int, ...]
             tup_type = tup_params[0]
@@ -498,21 +514,17 @@ class Converter(object):
                 return tuple(
                     conv(e, tup_type, ctx + (i,)) for i, e in enumerate(obj)
                 )
-            except UnstructuringError:
-                raise
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
         else:
             # We're dealing with a heterogenous tuple.
             try:
                 return tuple(
                     self._structure_func.dispatch(t)(e, t, ctx + (i,))
-                    for i, t, e in enumerate(zip(tup_params, obj))
+                    for i, (t, e) in enumerate(zip(tup_params, obj))
                 )
-            except UnstructuringError:
-                raise
             except Exception as e:
-                raise_from(UnstructuringError(ctx, str(e)), e)
+                self._raise_structure_error(e, ctx)
 
     def _get_dis_func(self, union):
         # type: (Type) -> Callable[..., Type]

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-from .converters import Converter, UnstructureStrategy
+from .converters import Converter, UnstructureStrategy, StructuringError
 
 __all__ = ('global_converter', 'unstructure', 'structure',
            'structure_attrs_fromtuple', 'structure_attrs_fromdict',
-           'UnstructureStrategy')
+           'UnstructureStrategy', 'StructuringError')
 
 __author__ = 'Tin Tvrtković'
 __email__ = 'tinchester@gmail.com'

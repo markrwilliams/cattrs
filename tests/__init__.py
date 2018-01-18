@@ -1,4 +1,5 @@
 import string
+import functools
 import keyword
 import os
 
@@ -140,7 +141,8 @@ def just_class(tup):
     nested_cl = tup[1][0]
     default = attr.Factory(nested_cl)
     combined_attrs = list(tup[0])
-    combined_attrs.append((attr.ib(default=default), st.just(nested_cl())))
+    combined_attrs.append((attr.ib(default=default, type=nested_cl),
+                           st.just(nested_cl())))
     return _create_hyp_class(combined_attrs)
 
 
@@ -148,7 +150,7 @@ def list_of_class(tup):
     nested_cl = tup[1][0]
     default = attr.Factory(lambda: [nested_cl()])
     combined_attrs = list(tup[0])
-    combined_attrs.append((attr.ib(default=default),
+    combined_attrs.append((attr.ib(default=default, type=List[nested_cl]),
                            st.just([nested_cl()])))
     return _create_hyp_class(combined_attrs)
 
@@ -157,12 +159,12 @@ def dict_of_class(tup):
     nested_cl = tup[1][0]
     default = attr.Factory(lambda: {"cls": nested_cl()})
     combined_attrs = list(tup[0])
-    combined_attrs.append((attr.ib(default=default),
+    combined_attrs.append((attr.ib(default=default, type=Dict[str, nested_cl]),
                           st.just({'cls': nested_cl()})))
     return _create_hyp_class(combined_attrs)
 
 
-def _create_hyp_nested_strategy(simple_class_strategy):
+def _create_hyp_nested_strategy(attrs, simple_class_strategy):
     """
     Create a recursive attrs class.
     Given a strategy for building (simpler) classes, create and return
@@ -173,7 +175,7 @@ def _create_hyp_nested_strategy(simple_class_strategy):
     """
     # A strategy producing tuples of the form ([list of attributes], <given
     # class strategy>).
-    attrs_and_classes = st.tuples(lists_of_attrs(defaults=True),
+    attrs_and_classes = st.tuples(lists_of_attrs(defaults=True, attrs=attrs),
                                   simple_class_strategy)
 
     return (attrs_and_classes.flatmap(just_class) |
@@ -202,7 +204,7 @@ def int_attrs(draw, defaults=None):
     default = NOTHING
     if defaults is True or (defaults is None and draw(st.booleans())):
         default = draw(st.integers())
-    return ((attr.ib(default=default), st.integers()))
+    return ((attr.ib(default=default, type=int), st.integers()))
 
 
 @st.composite
@@ -214,7 +216,7 @@ def str_attrs(draw, defaults=None):
     default = NOTHING
     if defaults is True or (defaults is None and draw(st.booleans())):
         default = draw(st.text())
-    return ((attr.ib(default=default), st.text()))
+    return ((attr.ib(default=default, type=unicode), st.text()))
 
 
 @st.composite
@@ -226,7 +228,7 @@ def float_attrs(draw, defaults=None):
     default = NOTHING
     if defaults is True or (defaults is None and draw(st.booleans())):
         default = draw(st.floats())
-    return ((attr.ib(default=default), st.floats()))
+    return ((attr.ib(default=default, type=float), st.floats()))
 
 
 @st.composite
@@ -240,7 +242,8 @@ def dict_attrs(draw, defaults=None):
     if defaults is True or (defaults is None and draw(st.booleans())):
         default_val = draw(val_strat)
         default = attr.Factory(lambda: default_val)
-    return ((attr.ib(default=default), val_strat))
+    type_ = draw(st.sampled_from([Mapping, MutableMapping, Dict]))
+    return ((attr.ib(default=default, type=type_[unicode, int]), val_strat))
 
 
 def simple_attrs(defaults=None):
@@ -248,23 +251,27 @@ def simple_attrs(defaults=None):
             float_attrs(defaults) | dict_attrs(defaults))
 
 
-def lists_of_attrs(defaults=None):
+def lists_of_attrs(defaults=None, attrs=simple_attrs):
     # Python functions support up to 255 arguments.
-    return (st.lists(simple_attrs(defaults), average_size=5, max_size=10)
+    return (st.lists(attrs(defaults), average_size=5, max_size=10)
             .map(lambda l: sorted(l,
                                   key=lambda t: t[0]._default is not NOTHING)))
 
 
-def simple_classes(defaults=None):
+def simple_classes(defaults=None, attrs=simple_attrs):
     """
     Return a strategy that yields tuples of simple classes and values to
     instantiate them.
     """
-    return lists_of_attrs(defaults).flatmap(_create_hyp_class)
+    return lists_of_attrs(defaults, attrs).flatmap(_create_hyp_class)
 
 
 # Ok, so st.recursive works by taking a base strategy (in this case,
 # simple_classes) and a special function. This function receives a strategy,
 # and returns another strategy (building on top of the base strategy).
-nested_classes = st.recursive(simple_classes(defaults=True),
-                              _create_hyp_nested_strategy)
+def make_nested_classes(attrs):
+    return st.recursive(simple_classes(defaults=True, attrs=attrs),
+                        functools.partial(_create_hyp_nested_strategy, attrs))
+
+
+nested_classes = make_nested_classes(simple_attrs)

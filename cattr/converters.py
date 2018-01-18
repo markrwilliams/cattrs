@@ -116,8 +116,7 @@ class Converter(object):
         ])
         # Strings are sequences.
         self._structure_func.register_cls_list([
-            (unicode, self._structure_unicode if is_py2
-             else self._structure_call),
+            (unicode, self._structure_call),
             (bytes, self._structure_call),
             (int, self._structure_call),
             (float, self._structure_call),
@@ -273,6 +272,11 @@ class Converter(object):
         etc.
         """
         try:
+            if not isinstance(obj, cl):
+                raise TypeError(
+                    "object {!r} of {} is not of {}".format(
+                        obj, type(obj), cl,
+                    ))
             return cl(obj)
         except Exception as e:
             self._raise_structure_error(e, ctx)
@@ -324,26 +328,26 @@ class Converter(object):
         """Instantiate an attrs class from a mapping (dict)."""
         # For public use.
         ctx += (cl.__name__,)
-        conv_obj = obj.copy()  # Dict of converted parameters.
-        dispatch = self._structure_func.dispatch
-        required = set()
-        for a in cl.__attrs_attrs__:
-            if a.default is attr.NOTHING:
-                required.add(a.name)
-            # We detect the type by metadata.
-            type_ = a.type
-            if type_ is None:
-                # No type.
-                continue
-            name = a.name
-            try:
-                val = obj[name]
-            except KeyError:
-                continue
-            conv_obj[name] = dispatch(type_)(val, type_, ctx + (name,))
-
         try:
-            return cl(**conv_obj)
+            conv_obj = obj.copy()  # Dict of converted parameters.
+            dispatch = self._structure_func.dispatch
+            required = set()
+            for a in cl.__attrs_attrs__:
+                if a.default is attr.NOTHING:
+                    required.add(a.name)
+                # We detect the type by metadata.
+                type_ = a.type
+                if type_ is None:
+                    # No type.
+                    continue
+                name = a.name
+                try:
+                    val = obj[name]
+                except KeyError:
+                    continue
+                conv_obj[name] = dispatch(type_)(val, type_, ctx + (name,))
+
+                return cl(**conv_obj)
         except TypeError:
             if not self._contextualize_structure_errors:
                 raise

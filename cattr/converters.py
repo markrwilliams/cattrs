@@ -3,7 +3,7 @@ from enum import Enum
 from typing import (List, Mapping, Sequence, Optional, MutableSequence,
                     TypeVar, Any, FrozenSet, MutableSet, Set, MutableMapping,
                     Dict, Tuple, _Union)
-from ._compat import lru_cache, unicode, bytes, is_py2, raise_from
+from ._compat import lru_cache, long, unicode, bytes, is_py2, raise_from
 from .disambiguators import create_uniq_field_dis_func
 from .multistrategy_dispatch import MultiStrategyDispatch
 
@@ -116,7 +116,8 @@ class Converter(object):
         ])
         # Strings are sequences.
         self._structure_func.register_cls_list([
-            (unicode, self._structure_call),
+            (unicode, self._structure_unicode if is_py2
+             else self._structure_call),
             (bytes, self._structure_call),
             (int, self._structure_call),
             (float, self._structure_call),
@@ -272,11 +273,6 @@ class Converter(object):
         etc.
         """
         try:
-            if not isinstance(obj, cl):
-                raise TypeError(
-                    "object {!r} of {} is not of {}".format(
-                        obj, type(obj), cl,
-                    ))
             return cl(obj)
         except Exception as e:
             self._raise_structure_error(e, ctx)
@@ -289,10 +285,7 @@ class Converter(object):
             except Exception as e:
                 self._raise_structure_error(e, ctx)
         else:
-            try:
-                return obj
-            except Exception as e:
-                self._raise_structure_error(e, ctx)
+            return obj
 
     # Attrs classes.
 
@@ -347,7 +340,7 @@ class Converter(object):
                     continue
                 conv_obj[name] = dispatch(type_)(val, type_, ctx + (name,))
 
-                return cl(**conv_obj)
+            return cl(**conv_obj)
         except TypeError:
             if not self._contextualize_structure_errors:
                 raise

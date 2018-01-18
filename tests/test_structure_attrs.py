@@ -3,18 +3,17 @@ import attr
 from attr import asdict, astuple, Factory, fields, NOTHING
 from hypothesis import assume, given
 from hypothesis.strategies import (booleans, composite, data,
-                                   frozensets, integers, lists,
-                                   randoms, recursive, sampled_from,
-                                   sets, tuples)
+                                   frozensets, integers, just, lists,
+                                   randoms, sampled_from, sets,
+                                   tuples)
 
 from pytest import raises
 
-from typing import (AbstractSet, FrozenSet, Mapping, MutableSequence,
-                    MutableSet, Union, Sequence, Set, Tuple)
+from typing import (AbstractSet, FrozenSet, Mapping, MutableSet,
+                    Union, Sequence, Set, Tuple)
 
-from . import (simple_attrs, simple_classes, list_types, int_attrs,
-               str_attrs, float_attrs, dict_attrs,
-               make_nested_classes)
+from . import (simple_classes, list_types, int_attrs, str_attrs,
+               float_attrs, dict_attrs, make_nested_classes)
 from cattr import StructuringError
 from cattr._compat import unicode, long
 
@@ -25,34 +24,52 @@ def make_default(defaults, draw, strategy):
     return NOTHING
 
 
+def make_type(draw, types, parameters):
+    type_ = draw(types)
+    maybe_parameter = draw(parameters)
+    if maybe_parameter is None:
+        return type_
+    return type_[maybe_parameter]
+
+
 @composite
 def set_attrs(draw, defaults=None):
-    type_ = draw(sampled_from([Set, MutableSet]))
+    type_ = make_type(draw,
+                      types=sampled_from([Set, MutableSet]),
+                      parameters=sampled_from([int, None]))
     val_strat = sets(integers())
     default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=type_[int], default=default), val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
 
 
 @composite
 def frozenset_attrs(draw, defaults=None):
     val_strat = frozensets(integers())
+    type_ = make_type(draw,
+                      types=just(FrozenSet),
+                      parameters=sampled_from([int, None]))
     default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=FrozenSet[int], default=default), val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
 
 
 @composite
 def list_attrs(draw, defaults=None):
-    type_ = draw(list_types)
+    type_ = make_type(draw,
+                      types=list_types,
+                      parameters=sampled_from([int, None]))
     val_strat = lists(integers())
     default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=type_[int], default=default), val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
 
 
 @composite
 def tuple_attrs(draw, defaults=None):
+    type_ = make_type(draw,
+                      types=just(Tuple),
+                      parameters=sampled_from([int, None]))
     val_strat = tuples(integers())
     default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=Tuple[int], default=default), val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
 
 
 def attrs_strategy(defaults):
@@ -103,25 +120,39 @@ def test_structure_simple_from_dict_default(converter, cl_and_vals, data):
     assert obj == converter.structure(dumped, cl)
 
 
+class Poison(object):
+    def __str__(self):
+        raise Exception
+
+    def __unicode__(self):
+        raise Exception
+
+
 def break_unstructured(random, unstructured, cls):
     """Make an unstructured class' dictionary un-structruable."""
     choices = []
 
+    NoneType = type(None)
+
     def _recur(count, current, ctx, type_):
-        if issubclass(
+        if isinstance(type_, type(Union)):
+            args = type_.__args__
+            next_type = (args[0] if args[1] is NoneType else args[1])
+            _recur(count + 1, current, ctx, next_type)
+        elif issubclass(
                 type_,
-                (bool, bytes, float, int, long, str, type(None), unicode)
+                (bool, bytes, float, int, long, NoneType, str, unicode)
         ):
             return
-        elif issubclass(type_, AbstractSet):
+        elif issubclass(type_, AbstractSet) and type_.__args__:
             [next_type] = type_.__args__
             for el in current:
                 _recur(count + 1, el, ctx, next_type)
-        elif issubclass(type_, Sequence):
+        elif issubclass(type_, Sequence) and type_.__args__:
             [next_type] = type_.__args__
             for i, el in enumerate(current):
                 _recur(count + 1, el, ctx + (repr(i),), next_type)
-        elif issubclass(type_, Mapping):
+        elif issubclass(type_, Mapping) and type_.__args__:
             choices.append((current, ctx))
             [_, next_type] = type_.__args__
             for key, value in current.items():
@@ -139,7 +170,7 @@ def break_unstructured(random, unstructured, cls):
     condemned, ctx = random.choice(choices)
     assume(condemned)
 
-    condemned[random.choice(list(condemned))] = object
+    condemned[random.choice(list(condemned))] = Poison()
 
     return ctx
 
@@ -158,7 +189,7 @@ def test_structure_from_dict_with_errors(
     unstructured = attr.asdict(cl(*vals))
     assume(unstructured)
     ctx = break_unstructured(random, unstructured, cl)
-    with raises(StructuringError):
+    with raises(StructuringError) as exc_info:
         contextualizing_converter.structure(unstructured, cl)
 
 

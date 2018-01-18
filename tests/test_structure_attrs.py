@@ -191,6 +191,7 @@ def test_structure_from_dict_with_errors(
     ctx = break_unstructured(random, unstructured, cl)
     with raises(StructuringError) as exc_info:
         contextualizing_converter.structure(unstructured, cl)
+    assert exc_info.value.ctx == ctx
 
 
 @given(simple_classes())

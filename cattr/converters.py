@@ -335,7 +335,6 @@ class Converter(object):
         # type: (Mapping, Type) -> Any
         """Instantiate an attrs class from a mapping (dict)."""
         # For public use.
-        cl_name = cl.__name__
         try:
             conv_obj = obj.copy()  # Dict of converted parameters.
             dispatch = self._structure_func.dispatch
@@ -432,7 +431,10 @@ class Converter(object):
         # type: (Type[GenericMeta], Mapping[T, V]) -> Dict[T, V]
         """Convert a mapping into a potentially generic dict."""
         if not cl.__args__ or cl.__args__ == (Any, Any):
-            return dict(obj)
+            try:
+                return dict(obj)
+            except Exception as e:
+                self._raise_structure_error(e, ctx)
         else:
             key_type, val_type = cl.__args__
             if key_type is Any:

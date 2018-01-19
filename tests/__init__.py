@@ -5,8 +5,9 @@ import os
 
 from collections import OrderedDict
 from enum import Enum
-from typing import (Tuple, Sequence, MutableSequence, List, Dict,
-                    MutableMapping, Mapping, Any)
+from typing import (FrozenSet, Tuple, Sequence, MutableSequence,
+                    MutableSet, List, Dict, MutableMapping, Mapping,
+                    Any, Set)
 from cattr._compat import is_py2, bytes, unicode
 
 import attr
@@ -183,6 +184,20 @@ def _create_hyp_nested_strategy(attrs, simple_class_strategy):
             attrs_and_classes.flatmap(dict_of_class))
 
 
+def make_default(defaults, draw, strategy):
+    if defaults is True or (defaults is None and draw(st.booleans())):
+        return draw(strategy)
+    return NOTHING
+
+
+def make_type(draw, types, parameters):
+    type_ = draw(types)
+    maybe_parameter = draw(parameters)
+    if maybe_parameter is None:
+        return type_
+    return type_[maybe_parameter]
+
+
 @st.composite
 def bare_attrs(draw, defaults=None):
     """
@@ -242,8 +257,51 @@ def dict_attrs(draw, defaults=None):
     if defaults is True or (defaults is None and draw(st.booleans())):
         default_val = draw(val_strat)
         default = attr.Factory(lambda: default_val)
-    type_ = draw(st.sampled_from([Mapping, MutableMapping, Dict]))
-    return ((attr.ib(default=default, type=type_[unicode, int]), val_strat))
+    type_ = make_type(draw,
+                      st.sampled_from([Mapping, MutableMapping, Dict]),
+                      st.sampled_from([(Any, int),
+                                       (unicode, int)]))
+    return ((attr.ib(default=default, type=type_), val_strat))
+
+
+@st.composite
+def set_attrs(draw, defaults=None):
+    type_ = make_type(draw,
+                      types=st.sampled_from([Set, MutableSet]),
+                      parameters=st.sampled_from([int, None]))
+    val_strat = st.sets(st.integers())
+    default = make_default(defaults, draw, val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
+
+
+@st.composite
+def frozenset_attrs(draw, defaults=None):
+    val_strat = st.frozensets(st.integers())
+    type_ = make_type(draw,
+                      types=st.just(FrozenSet),
+                      parameters=st.sampled_from([int, None]))
+    default = make_default(defaults, draw, val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
+
+
+@st.composite
+def list_attrs(draw, defaults=None):
+    type_ = make_type(draw,
+                      types=list_types,
+                      parameters=st.sampled_from([int, None]))
+    val_strat = st.lists(st.integers())
+    default = make_default(defaults, draw, val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
+
+
+@st.composite
+def tuple_attrs(draw, defaults=None):
+    type_ = make_type(draw,
+                      types=st.just(Tuple),
+                      parameters=st.sampled_from([int, None, (int, Ellipsis)]))
+    val_strat = st.tuples(st.integers())
+    default = make_default(defaults, draw, val_strat)
+    return (attr.ib(type=type_, default=default), val_strat)
 
 
 def simple_attrs(defaults=None):

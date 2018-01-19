@@ -2,87 +2,25 @@
 import attr
 from attr import asdict, astuple, Factory, fields, NOTHING
 from hypothesis import assume, given
-from hypothesis.strategies import (booleans, composite, data,
-                                   frozensets, integers, just, lists,
-                                   randoms, sampled_from, sets,
-                                   tuples)
+from hypothesis.strategies import (data, lists, randoms, sampled_from)
 
 from pytest import raises
 
-from typing import (FrozenSet, Mapping, MutableSet, Union, Sequence,
-                    Set, Tuple)
+from typing import (Any, FrozenSet, Mapping, Union, Sequence, Set)
 
-from . import (simple_classes, list_types, int_attrs, str_attrs,
-               float_attrs, dict_attrs, make_nested_classes)
+from . import (simple_classes, int_attrs, str_attrs, float_attrs,
+               dict_attrs, make_nested_classes, tuple_attrs,
+               set_attrs, list_attrs, frozenset_attrs)
 from cattr import StructuringError
 from cattr.converters import (format_seq, format_dict, format_set,
                               format_frozenset, format_attribute)
 from cattr._compat import unicode, long
 
 
-def make_default(defaults, draw, strategy):
-    if defaults is True or (defaults is None and draw(booleans())):
-        return draw(strategy)
-    return NOTHING
-
-
-def make_type(draw, types, parameters):
-    type_ = draw(types)
-    maybe_parameter = draw(parameters)
-    if maybe_parameter is None:
-        return type_
-    return type_[maybe_parameter]
-
-
-@composite
-def set_attrs(draw, defaults=None):
-    type_ = make_type(draw,
-                      types=sampled_from([Set, MutableSet]),
-                      parameters=sampled_from([int, None]))
-    val_strat = sets(integers())
-    default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=type_, default=default), val_strat)
-
-
-@composite
-def frozenset_attrs(draw, defaults=None):
-    val_strat = frozensets(integers())
-    type_ = make_type(draw,
-                      types=just(FrozenSet),
-                      parameters=sampled_from([int, None]))
-    default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=type_, default=default), val_strat)
-
-
-@composite
-def list_attrs(draw, defaults=None):
-    type_ = make_type(draw,
-                      types=list_types,
-                      parameters=sampled_from([int, None]))
-    val_strat = lists(integers())
-    default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=type_, default=default), val_strat)
-
-
-@composite
-def tuple_attrs(draw, defaults=None):
-    type_ = make_type(draw,
-                      types=just(Tuple),
-                      parameters=sampled_from([int, None]))
-    val_strat = tuples(integers())
-    default = make_default(defaults, draw, val_strat)
-    return (attr.ib(type=type_, default=default), val_strat)
-
-
-def attrs_strategy(defaults):
+def primitive_attrs(defaults):
     return (int_attrs(defaults)
             | str_attrs(defaults)
-            | float_attrs(defaults)
-            | dict_attrs(defaults)
-            | frozenset_attrs(defaults)
-            | set_attrs(defaults)
-            | list_attrs(defaults)
-            | tuple_attrs(defaults))
+            | float_attrs(defaults))
 
 
 @given(simple_classes())
@@ -130,82 +68,141 @@ class Poison(object):
         raise Exception
 
 
-def break_unstructured(random, unstructured, cls):
-    """Make an unstructured class' dictionary un-structruable."""
-    choices = []
-
-    NoneType = type(None)
-
-    def _recur(current, ctx, type_):
-        if isinstance(type_, type(Union)):
-            args = type_.__args__
-            next_ctx = ctx
-            next_type = (args[0] if args[1] is NoneType else args[1])
-            _recur(current, next_ctx, next_type)
-        elif issubclass(
-                type_,
-                (bool, bytes, float, int, long, NoneType, str, unicode)
-        ):
-            return
-        elif issubclass(type_, FrozenSet) and type_.__args__:
-            [next_type] = type_.__args__
-            for el in current:
-                next_ctx = ctx + (format_frozenset(next_type),)
-                _recur(el, next_ctx, next_type)
-        elif issubclass(type_, Set) and type_.__args__:
-            [next_type] = type_.__args__
-            for el in current:
-                next_ctx = ctx + (format_set(next_type),)
-                _recur(el, next_ctx, next_type)
-        elif issubclass(type_, Sequence) and type_.__args__:
-            [next_type] = type_.__args__
-            for i, el in enumerate(current):
-                next_ctx = ctx + (format_seq(i, next_type),)
-                _recur(el, next_ctx, next_type)
-        elif issubclass(type_, Mapping) and type_.__args__:
-            [_, next_type] = type_.__args__
-            items_ctxes = []
-            for key, value in current.items():
-                next_ctx = ctx + (format_dict(key, next_type),)
-                items_ctxes.append((key, next_ctx))
-                _recur(value, next_ctx, next_type)
-            choices.append((current, items_ctxes))
-        elif attr.has(type_):
-            items_ctxes = []
-            for a in attr.fields(type_):
-                next_ctx = ctx + (format_attribute(a.name, a.type),)
-                items_ctxes.append((a.name, next_ctx))
-                _recur(current[a.name], next_ctx, a.type)
-            choices.append((current, items_ctxes))
-
-    _recur(unstructured, (), cls)
-
-    condemned, items_ctxes = random.choice(choices)
-    assume(condemned)
-
-    item, ctx = random.choice(items_ctxes)
-    condemned[item] = Poison()
-
-    return ctx
-
-
-@given(make_nested_classes(attrs_strategy), randoms(), data())
-def test_structure_from_dict_with_errors(
-        contextualizing_converter, cl_and_vals, random, data,
-):
-    # type: (Converter, Any, Any, Any) -> None
-    """``StructureError``s ``ctx`` attribute refers to the point in
-    the source where an error occurred.  On Python 3,
-    ``StructureError``s are chained to the originating error.
+class TestContextualizingConverterStructuringErrors(object):
     """
-    cl, vals = cl_and_vals
+    Tests ``StructuringErrors`` with a contextualizing ``Converter``.
+    """
 
-    unstructured = attr.asdict(cl(*vals))
-    assume(unstructured)
-    ctx = break_unstructured(random, unstructured, cl)
-    with raises(StructuringError) as exc_info:
-        contextualizing_converter.structure(unstructured, cl)
-    assert exc_info.value.ctx == ctx
+    def break_unstructured(self, random, unstructured, cls):
+        """Make an unstructured class' dictionary un-structruable."""
+        choices = []
+
+        NoneType = type(None)
+
+        def first_param(type_):
+            return Any if not type_.__args__ else type_.__args__[0]
+
+        def recur(current, ctx, type_):
+            if isinstance(type_, type(Union)):
+                args = type_.__args__
+                next_ctx = ctx
+                next_type = (args[0] if args[1] is NoneType else args[1])
+                recur(current, next_ctx, next_type)
+            elif isinstance(type_, type(Any)) or issubclass(
+                    type_,
+                    (bool, bytes, float, int, long, NoneType, str, unicode)
+            ):
+                return
+            elif issubclass(type_, FrozenSet) and type_.__args__:
+                next_type = first_param(type_)
+                for el in current:
+                    next_ctx = ctx + (format_frozenset(next_type),)
+                    recur(el, next_ctx, next_type)
+            elif issubclass(type_, Set) and type_.__args__:
+                next_type = first_param(type_)
+                for el in current:
+                    next_ctx = ctx + (format_set(next_type),)
+                    recur(el, next_ctx, next_type)
+            elif issubclass(type_, Sequence) and type_.__args__:
+                next_type = first_param(type_)
+                for i, el in enumerate(current):
+                    next_ctx = ctx + (format_seq(i, next_type),)
+                    recur(el, next_ctx, next_type)
+            elif issubclass(type_, Mapping) and type_.__args__:
+                [_, next_type] = type_.__args__ if type_.__args__ else [None,
+                                                                        Any]
+                items_ctxes = []
+                for key, value in current.items():
+                    next_ctx = ctx + (format_dict(key, next_type),)
+                    items_ctxes.append((key, next_ctx))
+                    recur(value, next_ctx, next_type)
+                choices.append((current, items_ctxes))
+            elif attr.has(type_):
+                items_ctxes = []
+                for a in attr.fields(type_):
+                    next_ctx = ctx + (format_attribute(a.name, a.type),)
+                    items_ctxes.append((a.name, next_ctx))
+                    recur(current[a.name], next_ctx, a.type)
+                choices.append((current, items_ctxes))
+
+        recur(unstructured, (), cls)
+
+        condemned, items_ctxes = random.choice(choices)
+        assume(condemned)
+
+        item, ctx = random.choice(items_ctxes)
+        condemned[item] = Poison()
+
+        return ctx
+
+    def assert_unstructured_error_and_context(
+            self, contextualizing_converter, cl_and_vals, random, data,
+    ):
+        """``StructureError``s ``ctx`` attribute refers to the point in
+        the source where an error occurred.  On Python 3,
+        ``StructureError``s are chained to the originating error.
+        """
+        cl, vals = cl_and_vals
+
+        unstructured = attr.asdict(cl(*vals))
+        assume(unstructured)
+        ctx = self.break_unstructured(random, unstructured, cl)
+        with raises(StructuringError) as exc_info:
+            contextualizing_converter.structure(unstructured, cl)
+        assert exc_info.value.ctx == ctx
+
+    @given(make_nested_classes(primitive_attrs), randoms(), data())
+    def test_from_dict_with_primitive_attrs(
+            self, contextualizing_converter, cl_and_vals, random, data,
+    ):
+        self.assert_unstructured_error_and_context(
+            contextualizing_converter, cl_and_vals, random, data,
+        )
+
+    @given(
+        make_nested_classes(lambda defaults:
+                            dict_attrs(defaults) | int_attrs(defaults)),
+        randoms(),
+        data(),
+    )
+    def test_from_dict_with_dict_attrs(
+            self, contextualizing_converter, cl_and_vals, random, data,
+    ):
+        self.assert_unstructured_error_and_context(
+            contextualizing_converter, cl_and_vals, random, data,
+        )
+
+    @given(make_nested_classes(set_attrs), randoms(), data())
+    def test_from_dict_with_set_attrs(
+            self, contextualizing_converter, cl_and_vals, random, data,
+    ):
+        self.assert_unstructured_error_and_context(
+            contextualizing_converter, cl_and_vals, random, data,
+        )
+
+    @given(make_nested_classes(frozenset_attrs), randoms(), data())
+    def test_from_dict_with_frozenset_attrs(
+            self, contextualizing_converter, cl_and_vals, random, data,
+    ):
+        self.assert_unstructured_error_and_context(
+            contextualizing_converter, cl_and_vals, random, data,
+        )
+
+    @given(make_nested_classes(list_attrs), randoms(), data())
+    def test_from_dict_with_list_attrs(
+            self, contextualizing_converter, cl_and_vals, random, data,
+    ):
+        self.assert_unstructured_error_and_context(
+            contextualizing_converter, cl_and_vals, random, data,
+        )
+
+    @given(make_nested_classes(tuple_attrs), randoms(), data())
+    def test_from_dict_with_tuple_attrs(
+            self, contextualizing_converter, cl_and_vals, random, data,
+    ):
+        self.assert_unstructured_error_and_context(
+            contextualizing_converter, cl_and_vals, random, data,
+        )
 
 
 @given(simple_classes())

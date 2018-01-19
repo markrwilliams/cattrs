@@ -9,12 +9,14 @@ from hypothesis.strategies import (booleans, composite, data,
 
 from pytest import raises
 
-from typing import (AbstractSet, FrozenSet, Mapping, MutableSet,
-                    Union, Sequence, Set, Tuple)
+from typing import (FrozenSet, Mapping, MutableSet, Union, Sequence,
+                    Set, Tuple)
 
 from . import (simple_classes, list_types, int_attrs, str_attrs,
                float_attrs, dict_attrs, make_nested_classes)
 from cattr import StructuringError
+from cattr.converters import (format_seq, format_dict, format_set,
+                              format_frozenset, format_attribute)
 from cattr._compat import unicode, long
 
 
@@ -78,8 +80,8 @@ def attrs_strategy(defaults):
             | float_attrs(defaults)
             | dict_attrs(defaults)
             | frozenset_attrs(defaults)
-            | list_attrs(defaults)
             | set_attrs(defaults)
+            | list_attrs(defaults)
             | tuple_attrs(defaults))
 
 
@@ -134,43 +136,55 @@ def break_unstructured(random, unstructured, cls):
 
     NoneType = type(None)
 
-    def _recur(count, current, ctx, type_):
+    def _recur(current, ctx, type_):
         if isinstance(type_, type(Union)):
             args = type_.__args__
+            next_ctx = ctx
             next_type = (args[0] if args[1] is NoneType else args[1])
-            _recur(count + 1, current, ctx, next_type)
+            _recur(current, next_ctx, next_type)
         elif issubclass(
                 type_,
                 (bool, bytes, float, int, long, NoneType, str, unicode)
         ):
             return
-        elif issubclass(type_, AbstractSet) and type_.__args__:
+        elif issubclass(type_, FrozenSet) and type_.__args__:
             [next_type] = type_.__args__
             for el in current:
-                _recur(count + 1, el, ctx, next_type)
+                next_ctx = ctx + (format_frozenset(next_type),)
+                _recur(el, next_ctx, next_type)
+        elif issubclass(type_, Set) and type_.__args__:
+            [next_type] = type_.__args__
+            for el in current:
+                next_ctx = ctx + (format_set(next_type),)
+                _recur(el, next_ctx, next_type)
         elif issubclass(type_, Sequence) and type_.__args__:
             [next_type] = type_.__args__
             for i, el in enumerate(current):
-                _recur(count + 1, el, ctx + (repr(i),), next_type)
+                next_ctx = ctx + (format_seq(i, next_type),)
+                _recur(el, next_ctx, next_type)
         elif issubclass(type_, Mapping) and type_.__args__:
-            choices.append((current, ctx))
             [_, next_type] = type_.__args__
+            items_ctxes = []
             for key, value in current.items():
-                _recur(count + 1, value, ctx + (repr(key),), next_type)
+                next_ctx = ctx + (format_dict(key, next_type),)
+                items_ctxes.append((key, next_ctx))
+                _recur(value, next_ctx, next_type)
+            choices.append((current, items_ctxes))
         elif attr.has(type_):
-            choices.append((current, ctx))
+            items_ctxes = []
             for a in attr.fields(type_):
-                _recur(count + 1,
-                       current[a.name],
-                       ctx + (repr(type_.__name__), repr(a.name)),
-                       a.type)
+                next_ctx = ctx + (format_attribute(a.name, a.type),)
+                items_ctxes.append((a.name, next_ctx))
+                _recur(current[a.name], next_ctx, a.type)
+            choices.append((current, items_ctxes))
 
-    _recur(1, unstructured, (), cls)
+    _recur(unstructured, (), cls)
 
-    condemned, ctx = random.choice(choices)
+    condemned, items_ctxes = random.choice(choices)
     assume(condemned)
 
-    condemned[random.choice(list(condemned))] = Poison()
+    item, ctx = random.choice(items_ctxes)
+    condemned[item] = Poison()
 
     return ctx
 

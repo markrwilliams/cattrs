@@ -13,9 +13,24 @@ T = TypeVar('T')
 V = TypeVar('V')
 
 
-def format_context(ctx):
-    """Format the context to show causality."""
-    return "->".join(repr(element) for element in ctx)
+def format_seq(index, type_):
+    return "[{}]: {}".format(index, type_)
+
+
+def format_dict(index, type_):
+    return "[{!r}]: {}".format(index, type_)
+
+
+def format_set(type_):
+    return "<in set>: {}".format(type_)
+
+
+def format_frozenset(type_):
+    return "<in frozenset>: {}".format(type_)
+
+
+def format_attribute(attr_, type_):
+    return ".{}: {}".format(attr_, type_)
 
 
 class StructuringError(Exception):
@@ -23,7 +38,7 @@ class StructuringError(Exception):
 
     def __init__(self, ctx, message):
         if ctx:
-            exc_message = "{}: {}".format(format_context(ctx), message)
+            exc_message = "{}\n{}".format(" ->\n".join(ctx), message)
         else:
             exc_message = message
         super(StructuringError, self).__init__(exc_message)
@@ -296,7 +311,7 @@ class Converter(object):
         for a, value in zip(cl.__attrs_attrs__, obj):
             # We detect the type by the metadata.
             converted = self._structure_attr_from_tuple(
-                a, a.name, value, ctx + (a.name,)
+                a, a.name, value, ctx + (format_attribute(a.name, a.type),)
             )
             conv_obj.append(converted)
 
@@ -320,7 +335,7 @@ class Converter(object):
         # type: (Mapping, Type) -> Any
         """Instantiate an attrs class from a mapping (dict)."""
         # For public use.
-        ctx += (cl.__name__,)
+        cl_name = cl.__name__
         try:
             conv_obj = obj.copy()  # Dict of converted parameters.
             dispatch = self._structure_func.dispatch
@@ -338,7 +353,9 @@ class Converter(object):
                     val = obj[name]
                 except KeyError:
                     continue
-                conv_obj[name] = dispatch(type_)(val, type_, ctx + (name,))
+                conv_obj[name] = dispatch(type_)(val, type_, ctx + (
+                    format_attribute(a.name, type_),
+                ))
 
             return cl(**conv_obj)
         except TypeError:
@@ -364,7 +381,7 @@ class Converter(object):
             try:
                 return [
                     self._structure_func.dispatch(elem_type)(
-                        e, elem_type, ctx + (i,)
+                        e, elem_type, ctx + (format_seq(i, elem_type),)
                     )
                     for i, e in enumerate(obj)
                 ]
@@ -383,7 +400,9 @@ class Converter(object):
             elem_type = cl.__args__[0]
             try:
                 return {
-                    self._structure_func.dispatch(elem_type)(e, elem_type, ctx)
+                    self._structure_func.dispatch(elem_type)(
+                        e, elem_type, ctx + (format_set(elem_type),)
+                    )
                     for e in obj
                 }
             except Exception as e:
@@ -402,7 +421,9 @@ class Converter(object):
             dispatch = self._structure_func.dispatch
             try:
                 return frozenset(
-                    dispatch(elem_type)(e, elem_type, ctx) for e in obj
+                    dispatch(elem_type)(
+                        e, elem_type, ctx + (format_frozenset(elem_type),)
+                    ) for e in obj
                 )
             except Exception as e:
                 self._raise_structure_error(e, ctx)
@@ -418,7 +439,9 @@ class Converter(object):
                 val_conv = self._structure_func.dispatch(val_type)
                 try:
                     return {
-                        k: val_conv(v, val_type, ctx + (k,))
+                        k: val_conv(
+                            v, val_type, ctx + (format_dict(k, val_type),)
+                        )
                         for k, v in obj.items()
                     }
                 except Exception as e:
@@ -427,7 +450,9 @@ class Converter(object):
                 key_conv = self._structure_func.dispatch(key_type)
                 try:
                     return {
-                        key_conv(k, key_type, ctx + (k,)): v
+                        key_conv(
+                            k, key_type, ctx + (format_dict(k, key_type),)
+                        ): v
                         for k, v in obj.items()
                     }
                 except Exception as e:
@@ -437,8 +462,14 @@ class Converter(object):
                 val_conv = self._structure_func.dispatch(val_type)
                 try:
                     return {
-                        key_conv(k, key_type): val_conv(
-                            v, val_type, ctx + (k,)
+                        key_conv(
+                            k, key_type, ctx + (
+                                format_dict(k, key_type),
+                            )
+                        ): val_conv(
+                            v, val_type, ctx + (
+                                format_dict(k, val_type),
+                            ),
                         )
                         for k, v in obj.items()
                     }
@@ -509,7 +540,8 @@ class Converter(object):
             conv = self._structure_func.dispatch(tup_type)
             try:
                 return tuple(
-                    conv(e, tup_type, ctx + (i,)) for i, e in enumerate(obj)
+                    conv(e, tup_type, ctx + (format_seq(i, tup_type),))
+                    for i, e in enumerate(obj)
                 )
             except Exception as e:
                 self._raise_structure_error(e, ctx)
@@ -517,7 +549,9 @@ class Converter(object):
             # We're dealing with a heterogenous tuple.
             try:
                 return tuple(
-                    self._structure_func.dispatch(t)(e, t, ctx + (i,))
+                    self._structure_func.dispatch(t)(
+                        e, t, ctx + (format_seq(i, t),)
+                    )
                     for i, (t, e) in enumerate(zip(tup_params, obj))
                 )
             except Exception as e:
